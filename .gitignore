@@ -1,0 +1,45 @@
+# Python bytecode and cache artifacts
+*.pyc
+*.pyo
+*.pyd
+*.py,cover
+__pycache__/
+
+# Project folders
+.vscode/
+data/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and local runtime files
+*.log
+*.pid
+
+# Local environment/config secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

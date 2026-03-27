@@ -1,0 +1,93 @@
+/* dashboard/assets/style.css */
+
+/* ── 全局亮色背景 ─────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] {
+    background-color: #f6f8fa;
+}
+
+/* ── 侧边栏收窄 ───────────────────────────────────────────────── */
+[data-testid="stSidebar"] {
+    min-width: 220px;
+    max-width: 260px;
+    background-color: #ffffff;
+}
+
+/* ── 候选卡片 ─────────────────────────────────────────────────── */
+.candidate-card {
+    background: #ffffff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    transition: border-color 0.2s ease;
+}
+.candidate-card:hover {
+    border-color: #4a90d9;
+}
+
+.candidate-code {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #1f2328;
+}
+
+.candidate-strategy {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+.strategy-brick { background: #d4f5e2; color: #1a7f37; }
+.strategy-b1    { background: #daeeff; color: #0969da; }
+
+.candidate-meta {
+    font-size: 0.82rem;
+    color: #636c76;
+    margin-top: 4px;
+}
+
+.pct-positive { color: #cf222e; font-weight: 600; }
+.pct-negative { color: #1a7f37; font-weight: 600; }
+
+/* ── 摘要表格 ─────────────────────────────────────────────────── */
+.summary-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.84rem;
+}
+.summary-table th {
+    color: #636c76;
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 1px solid #d0d7de;
+}
+.summary-table td {
+    color: #1f2328;
+    padding: 4px 8px;
+}
+.summary-table tr:hover td {
+    background: rgba(0,0,0,0.03);
+}
+
+/* ── 页眉徽标 ─────────────────────────────────────────────────── */
+.header-badge {
+    display: inline-block;
+    background: #d4f5e2;
+    color: #1a7f37;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 20px;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+
+/* ── 分割线 ───────────────────────────────────────────────────── */
+.section-divider {
+    border: none;
+    border-top: 1px solid #d0d7de;
+    margin: 16px 0;
+}
