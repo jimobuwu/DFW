@@ -93,10 +93,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="导出候选股票 K 线图")
     parser.add_argument("--candidates", default=None,
                         help="候选文件路径（默认 data/candidates/candidates_latest.json）")
+    parser.add_argument("--raw-dir", default=None,
+                        help="原始日线 CSV 目录（默认 data/raw）")
+    parser.add_argument("--out-dir", default=None,
+                        help="K 线图输出目录（默认 data/kline）")
     cli_args = parser.parse_args()
 
     candidates_path = Path(cli_args.candidates) if cli_args.candidates else Path(CONFIG["candidates"])
-    raw_dir         = Path(CONFIG["raw_dir"])
+    raw_dir         = Path(cli_args.raw_dir) if cli_args.raw_dir else Path(CONFIG["raw_dir"])
 
     codes, pick_date = _load_candidates(candidates_path)
 
@@ -107,7 +111,8 @@ def main() -> None:
         sys.exit(1)
     print(f"[INFO] 导出日期：{export_date}")
 
-    out_root = Path(CONFIG["out_dir"]) / export_date
+    out_base = Path(cli_args.out_dir) if cli_args.out_dir else Path(CONFIG["out_dir"])
+    out_root = out_base / export_date
 
     ok_count    = 0
     skip_count  = 0

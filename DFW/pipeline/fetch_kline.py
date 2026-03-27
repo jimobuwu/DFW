@@ -232,9 +232,12 @@ def _load_config(config_path: Path = _CONFIG_PATH) -> dict:
 
 
 # --------------------------- 主入口 --------------------------- #
-def main(log_path: Optional[Path] = None):
+def main(log_path: Optional[Path] = None, out_override: Optional[str] = None):
     # ---------- 读取 YAML 配置 ---------- #
     cfg = _load_config()
+
+    if out_override:
+        cfg["out"] = out_override
 
     # ---------- 日志路径（优先参数，其次 YAML，最后默认值） ---------- #
     if log_path is None:
@@ -295,4 +298,8 @@ def main(log_path: Optional[Path] = None):
     logger.info("全部任务完成，数据已保存至 %s", out_dir.resolve())
 
 if __name__ == "__main__":
-    main()
+    import argparse as _ap
+    _parser = _ap.ArgumentParser(description="拉取 K 线数据")
+    _parser.add_argument("--out", default=None, help="K 线数据输出目录（覆盖配置文件）")
+    _args = _parser.parse_args()
+    main(out_override=_args.out)
