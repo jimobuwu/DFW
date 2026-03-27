@@ -60,7 +60,7 @@ class ZhipuNewsReviewer(BaseReviewer):
         super().__init__(config)
         
         # 智谱API Key（复用原有key）
-        api_key = "8898c4ad05e64c58b3669beebabe1014.GgDcUhtAT3PFYcgz"  # 也可改为从环境变量读取
+        api_key = os.environ.get("ZHIPU_API_KEY", "")
         if not api_key:
             print("[ERROR] 未找到环境变量 ZHIPU_API_KEY，请先设置后重试。", file=sys.stderr)
             sys.exit(1)

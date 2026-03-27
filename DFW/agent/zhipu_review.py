@@ -80,8 +80,7 @@ class ZhipuReviewer(BaseReviewer):
         super().__init__(config)
         
         # 智谱 API Key
-        # api_key = os.environ.get("ZHIPU_API_KEY", "")
-        api_key = "8898c4ad05e64c58b3669beebabe1014.GgDcUhtAT3PFYcgz"
+        api_key = os.environ.get("ZHIPU_API_KEY", "")
         if not api_key:
             print("[ERROR] 未找到环境变量 ZHIPU_API_KEY，请先设置后重试。", file=sys.stderr)
             sys.exit(1)
