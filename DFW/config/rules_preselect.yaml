@@ -20,6 +20,18 @@ b1:
   j_threshold: 15.0
   j_q_threshold: 0.10
 
+# ── B2 策略参数（B1 后缩量回调 + 倍量反包） ──────────────────────────
+b2:
+  enabled: true
+  b1_lookback: 30               # B1 买点回溯窗口（日）
+  min_shrink_days: 2            # 缩量回调最少天数
+  volume_ratio: 1.3             # 放量倍数阈值（1.3 = 30%+）
+  zxdkx_tolerance: 0.03         # 回调到黄线附近的容差（3%）
+  max_return: 0.098             # 今日最大涨幅（排除涨停追高）
+  no_long_lower_shadow: true    # 排除大长下影线
+  shadow_body_ratio: 1.5        # 下影线/实体比阈值
+  require_weekly_ma_bull: true  # 要求周线多头排列
+
 # ── 砖型图（BrickChart）策略参数 ──────────────────────────────────────
 brick:
   enabled: true
@@ -55,3 +67,11 @@ brick:
   wma_short: 5
   wma_mid: 10
   wma_long: 20
+
+  # 大上影线排除（砖型图形态红线）
+  filter_upper_shadow: true
+  upper_shadow_ratio: 1.5       # 上影线 > 实体 × ratio 则排除
+
+  # 白黄线距离过滤（双线战法：白线距黄线太远成功率低）
+  filter_zx_spread: true
+  max_zx_spread: 0.15           # (zxdq - zxdkx) / zxdkx > 15% 则排除

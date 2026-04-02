@@ -19,7 +19,8 @@ Selector.py — 模块化、向量化、Numba 加速选股框架
 Selector 一览
 -------------
 - ``B1Selector``          KDJ 分位 + 知行线 + 周线多头排列
-- ``BrickChartSelector``  砖型图形态 + 知行线 + 周线多头排列
+- ``B2Selector``          B2 倍量反包买点（B1 后缩量回调 + 放量阳线反包）
+- ``BrickChartSelector``  砖型图形态 + 知行线 + 周线多头排列 + 大上影排除
 """
 from __future__ import annotations
 
@@ -78,6 +79,35 @@ def _max_vol_not_bearish(
                 max_idx = j
         mask[i] = close[max_idx] >= open_[max_idx]
     return mask
+
+# ── 连续缩量计数 ─────────────────────────────────────────────────────────
+@_njit(cache=True)
+def _shrink_vol_run(vol: np.ndarray) -> np.ndarray:
+    """shrink_run[i] = 截至 i 连续缩量天数（volume[i] < volume[i-1]）。"""
+    n = len(vol)
+    out = np.zeros(n, dtype=np.int32)
+    for i in range(1, n):
+        if vol[i] < vol[i - 1]:
+            out[i] = out[i - 1] + 1
+        else:
+            out[i] = 0
+    return out
+
+
+# ── B1 买点回溯检测 ──────────────────────────────────────────────────────
+@_njit(cache=True)
+def _has_b1_in_lookback(b1_mask: np.ndarray, lookback: int) -> np.ndarray:
+    """past_b1[i] = 在 [i-lookback, i-1] 窗口中是否存在 b1_mask=True。"""
+    n = len(b1_mask)
+    out = np.zeros(n, dtype=np.bool_)
+    for i in range(1, n):
+        start = max(0, i - lookback)
+        for j in range(start, i):
+            if b1_mask[j]:
+                out[i] = True
+                break
+    return out
+
 
 # ── 砖型图核心 ────────────────────────────────────────────────────────────
 @_njit(cache=True)
@@ -672,6 +702,215 @@ class ZXDQRatioFilter:
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. 大上影线排除过滤（砖型图形态红线）
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class UpperShadowFilter:
+    """
+    排除"大苗子"（大上影线）K 线。
+
+    上影线长度 > 实体 × shadow_body_ratio 时排除。
+    砖型图战法核心形态红线之一。
+    """
+    shadow_body_ratio: float = 1.5
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if hist.empty:
+            return True
+        row = hist.iloc[-1]
+        body = abs(float(row["close"]) - float(row["open"]))
+        upper_shadow = float(row["high"]) - max(float(row["close"]), float(row["open"]))
+        if body <= 0:
+            return upper_shadow <= 0
+        return upper_shadow <= body * self.shadow_body_ratio
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        close_v = df["close"].to_numpy(dtype=float)
+        open_v = df["open"].to_numpy(dtype=float)
+        high_v = df["high"].to_numpy(dtype=float)
+        body = np.abs(close_v - open_v)
+        max_co = np.maximum(close_v, open_v)
+        upper_shadow = high_v - max_co
+        safe_body = np.where(body > 0, body, 1e9)
+        return upper_shadow <= safe_body * self.shadow_body_ratio
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. 白黄线距离过滤（双线战法：白线距黄线过远则成功率低）
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ZXSpreadFilter:
+    """
+    排除白线距离黄线过远的标的。
+
+    双线战法核心逻辑：白线距黄线太远时成功率低。
+    条件：(zxdq - zxdkx) / zxdkx <= max_spread
+    """
+    max_spread: float = 0.15
+    zx_m1: int = 14
+    zx_m2: int = 28
+    zx_m3: int = 57
+    zx_m4: int = 114
+    zxdq_span: int = 10
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if hist.empty:
+            return False
+        if "zxdq" in hist.columns and "zxdkx" in hist.columns:
+            zxdq_v = float(hist["zxdq"].iloc[-1])
+            zxdkx_v = float(hist["zxdkx"].iloc[-1])
+        else:
+            zs, zk = compute_zx_lines(
+                hist, self.zx_m1, self.zx_m2, self.zx_m3, self.zx_m4,
+                zxdq_span=self.zxdq_span,
+            )
+            zxdq_v = float(zs.iloc[-1])
+            zxdkx_v = float(zk.iloc[-1])
+        if not (np.isfinite(zxdq_v) and np.isfinite(zxdkx_v) and zxdkx_v > 0):
+            return False
+        return (zxdq_v - zxdkx_v) / zxdkx_v <= self.max_spread
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        if "zxdq" in df.columns and "zxdkx" in df.columns:
+            zxdq_v = df["zxdq"].to_numpy(dtype=float)
+            zxdkx_v = df["zxdkx"].to_numpy(dtype=float)
+        else:
+            zs, zk = compute_zx_lines(
+                df, self.zx_m1, self.zx_m2, self.zx_m3, self.zx_m4,
+                zxdq_span=self.zxdq_span,
+            )
+            zxdq_v = zs.to_numpy(dtype=float)
+            zxdkx_v = zk.to_numpy(dtype=float)
+        valid = np.isfinite(zxdq_v) & np.isfinite(zxdkx_v) & (zxdkx_v > 0)
+        spread = np.where(valid, (zxdq_v - zxdkx_v) / np.where(zxdkx_v > 0, zxdkx_v, 1.0), np.inf)
+        return valid & (spread <= self.max_spread)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. B2 倍量反包过滤（B1 后缩量回调 + 放量阳线反包）
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class B2VolumeReverseFilter:
+    """
+    B2 买点核心过滤器：
+
+    1. 近 b1_lookback 日内存在 B1 买点
+    2. B1 后出现缩量回调（连续 >= min_shrink_days 日量缩）
+    3. 回调低点接近黄线：close 在 zxdkx × [1-zxdkx_tolerance, 1+zxdkx_tolerance]
+    4. 今日放量阳线反包：
+       - close > open（阳线）
+       - volume >= prev_volume × volume_ratio
+       - close >= prev_close（反包/上涨）
+    5. 非涨停追高：涨幅 < max_return
+
+    依赖预计算列：'_b1_pick'（B1 选股 mask）、'zxdkx'。
+    """
+    b1_lookback: int = 30
+    min_shrink_days: int = 2
+    volume_ratio: float = 1.3
+    zxdkx_tolerance: float = 0.03
+    max_return: float = 0.098
+    no_long_lower_shadow: bool = True
+    shadow_body_ratio: float = 1.5
+
+    def __call__(self, hist: pd.DataFrame) -> bool:
+        if len(hist) < self.b1_lookback + 5:
+            return False
+        close = hist["close"].to_numpy(dtype=float)
+        open_ = hist["open"].to_numpy(dtype=float)
+        vol = hist["volume"].to_numpy(dtype=float)
+        low = hist["low"].to_numpy(dtype=float)
+
+        c0, o0, c1 = close[-1], open_[-1], close[-2]
+        v0, v1 = vol[-1], vol[-2]
+
+        if c0 <= o0:
+            return False
+        if c1 <= 0 or (c0 / c1 - 1.0) >= self.max_return:
+            return False
+        if v1 <= 0 or v0 < v1 * self.volume_ratio:
+            return False
+        if c0 < c1:
+            return False
+
+        if self.no_long_lower_shadow:
+            body = abs(c0 - o0)
+            lower_shadow = min(c0, o0) - low[-1]
+            if body > 0 and lower_shadow > body * self.shadow_body_ratio:
+                return False
+
+        if "zxdkx" in hist.columns:
+            zxdkx_v = float(hist["zxdkx"].iloc[-1])
+            if np.isfinite(zxdkx_v) and zxdkx_v > 0:
+                ratio = c0 / zxdkx_v
+                if not (1 - self.zxdkx_tolerance <= ratio <= 1 + self.zxdkx_tolerance + 0.10):
+                    return False
+
+        if "_b1_pick" in hist.columns:
+            b1arr = hist["_b1_pick"].to_numpy(dtype=bool)
+            found = False
+            for i in range(max(0, len(b1arr) - self.b1_lookback - 1), len(b1arr) - 1):
+                if b1arr[i]:
+                    found = True
+                    break
+            if not found:
+                return False
+
+        shrink_run = _shrink_vol_run(vol)
+        if shrink_run[-2] < self.min_shrink_days:
+            return False
+
+        return True
+
+    def vec_mask(self, df: pd.DataFrame) -> np.ndarray:
+        close_v = df["close"].to_numpy(dtype=float)
+        open_v = df["open"].to_numpy(dtype=float)
+        vol_v = df["volume"].to_numpy(dtype=float)
+        low_v = df["low"].to_numpy(dtype=float)
+
+        cp = np.empty_like(close_v); cp[0] = np.nan; cp[1:] = close_v[:-1]
+        vp = np.empty_like(vol_v); vp[0] = np.nan; vp[1:] = vol_v[:-1]
+
+        cond_yang = close_v > open_v
+        safe_cp = np.where(cp > 0, cp, 1.0)
+        cond_ret = (close_v / safe_cp - 1.0) < self.max_return
+        safe_vp = np.where(vp > 0, vp, 1e18)
+        cond_vol = vol_v >= safe_vp * self.volume_ratio
+        cond_cover = close_v >= cp
+
+        mask = cond_yang & cond_ret & cond_vol & cond_cover
+
+        if self.no_long_lower_shadow:
+            body = np.abs(close_v - open_v)
+            lower_shadow = np.minimum(close_v, open_v) - low_v
+            safe_body = np.where(body > 0, body, 1e9)
+            mask &= lower_shadow <= safe_body * self.shadow_body_ratio
+
+        if "zxdkx" in df.columns:
+            zxdkx_v = df["zxdkx"].to_numpy(dtype=float)
+            valid_zx = np.isfinite(zxdkx_v) & (zxdkx_v > 0)
+            safe_zx = np.where(zxdkx_v > 0, zxdkx_v, 1.0)
+            ratio = close_v / safe_zx
+            lb = 1 - self.zxdkx_tolerance
+            ub = 1 + self.zxdkx_tolerance + 0.10
+            mask &= (~valid_zx) | ((ratio >= lb) & (ratio <= ub))
+
+        if "_b1_pick" in df.columns:
+            b1_mask = df["_b1_pick"].to_numpy(dtype=bool)
+            past_b1 = _has_b1_in_lookback(b1_mask, self.b1_lookback)
+            mask &= past_b1
+
+        shrink_run = _shrink_vol_run(vol_v)
+        sr_prev = np.empty_like(shrink_run); sr_prev[0] = 0; sr_prev[1:] = shrink_run[:-1]
+        mask &= sr_prev >= self.min_shrink_days
+
+        return mask
+
+
 # =============================================================================
 # ── 具体 Selector 实现 ────────────────────────────────────────────────────────
 # =============================================================================
@@ -775,11 +1014,13 @@ class B1Selector(PipelineSelector):
 
 class BrickChartSelector(PipelineSelector):
     """
-    砖型图选股器，由以下四个独立模块组成：
+    砖型图选股器，由以下模块组成：
       ① BrickPatternFilter   — 形态（红/绿柱 + 涨幅 + 连续绿柱数）
       ② ZXDQRatioFilter      — close < zxdq × ratio          [可选]
       ③ ZXConditionFilter     — zxdq > zxdkx                  [可选]
       ④ WeeklyMABullFilter   — 周线多头排列                    [可选]
+      ⑤ UpperShadowFilter    — 大上影线排除                    [可选]
+      ⑥ ZXSpreadFilter       — 白黄线距离过远排除              [可选]
 
     快速用法::
 
@@ -812,6 +1053,12 @@ class BrickChartSelector(PipelineSelector):
         require_weekly_ma_bull: bool = True,
         # ── 周线参数 ──
         wma_short: int = 20, wma_mid: int = 60, wma_long: int = 120,
+        # ── 大上影线排除 ──
+        filter_upper_shadow: bool = True,
+        upper_shadow_ratio: float = 1.5,
+        # ── 白黄线距离过滤 ──
+        filter_zx_spread: bool = True,
+        max_zx_spread: float = 0.15,
         # ── 基类参数 ──
         date_col:          str = "date",
         extra_bars_buffer: int = 10,
@@ -847,19 +1094,31 @@ class BrickChartSelector(PipelineSelector):
             WeeklyMABullFilter(wma_short=wma_short, wma_mid=wma_mid, wma_long=wma_long)
             if require_weekly_ma_bull else None
         )
+        self._shadow_filter: Optional[UpperShadowFilter] = (
+            UpperShadowFilter(shadow_body_ratio=upper_shadow_ratio)
+            if filter_upper_shadow else None
+        )
+        self._spread_filter: Optional[ZXSpreadFilter] = (
+            ZXSpreadFilter(
+                max_spread=max_zx_spread,
+                zx_m1=zxdkx_m1, zx_m2=zxdkx_m2,
+                zx_m3=zxdkx_m3, zx_m4=zxdkx_m4,
+                zxdq_span=zxdq_span,
+            ) if filter_zx_spread else None
+        )
 
-        # 传给基类的 filters（用于 _passes / passes_hist）
         _filters: list = [self._pattern_filter]
         if self._zxdq_ratio_filter is not None: _filters.append(self._zxdq_ratio_filter)
         if self._zxdq_gt_filter    is not None: _filters.append(self._zxdq_gt_filter)
         if self._wma_filter        is not None: _filters.append(self._wma_filter)
+        if self._shadow_filter     is not None: _filters.append(self._shadow_filter)
+        if self._spread_filter     is not None: _filters.append(self._spread_filter)
 
         super().__init__(
             _filters, date_col=date_col,
             min_bars=max(n + 3, 1 + min_prior_green_bars + 1, zxdkx_m4, wma_long * 5),
             extra_bars_buffer=extra_bars_buffer,
         )
-        # 保存参数供 prepare_df
         self.zxdq_span  = zxdq_span
         self.zxdkx_m1, self.zxdkx_m2 = zxdkx_m1, zxdkx_m2
         self.zxdkx_m3, self.zxdkx_m4 = zxdkx_m3, zxdkx_m4
@@ -894,6 +1153,8 @@ class BrickChartSelector(PipelineSelector):
         if self._zxdq_ratio_filter is not None: fs.append(self._zxdq_ratio_filter)
         if self._zxdq_gt_filter    is not None: fs.append(self._zxdq_gt_filter)
         if self._wma_filter        is not None: fs.append(self._wma_filter)
+        if self._shadow_filter     is not None: fs.append(self._shadow_filter)
+        if self._spread_filter     is not None: fs.append(self._spread_filter)
         return _apply_vec_filters(df, fs)
 
     # ── 公开接口 ───────────────────────────────────────────────────────────
@@ -931,6 +1192,99 @@ class BrickChartSelector(PipelineSelector):
             val = float(hist["brick_growth"].iloc[-1])
             return val if np.isfinite(val) else -np.inf
         return float(self._pattern_filter.brick_growth_arr(hist)[-1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B2Selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+class B2Selector(PipelineSelector):
+    """
+    B2 选股器 — B1 后的二次买点（倍量反包）。
+
+    核心逻辑：
+      1. 近 b1_lookback 日内该股票曾触发 B1 买点
+      2. B1 后出现缩量回调（连续 >= min_shrink_days 日量缩）
+      3. 回调低点接近黄线（zxdkx）附近
+      4. 今日出现放量阳线反包
+      5. 排除大长下影线（反面案例）
+      6. 周线多头排列 [可选]
+
+    ``prepare_df()`` 先调用内置 B1Selector 计算 ``_b1_pick``，
+    然后计算 B2 特征列和 ``_vec_pick``。
+    """
+
+    def __init__(
+        self,
+        *,
+        # ── B1 内嵌参数 ──
+        j_threshold: float = 15.0,
+        j_q_threshold: float = 0.10,
+        kdj_n: int = 9,
+        zx_m1: int = 14, zx_m2: int = 28,
+        zx_m3: int = 57, zx_m4: int = 114,
+        zxdq_span: int = 10,
+        wma_short: int = 10, wma_mid: int = 20, wma_long: int = 30,
+        # ── B2 专属参数 ──
+        b1_lookback: int = 30,
+        min_shrink_days: int = 2,
+        volume_ratio: float = 1.3,
+        zxdkx_tolerance: float = 0.03,
+        max_return: float = 0.098,
+        no_long_lower_shadow: bool = True,
+        shadow_body_ratio: float = 1.5,
+        # ── 周线过滤 ──
+        require_weekly_ma_bull: bool = True,
+        # ── 基类参数 ──
+        date_col: str = "date",
+        extra_bars_buffer: int = 20,
+    ) -> None:
+        self._b1_selector = B1Selector(
+            j_threshold=j_threshold, j_q_threshold=j_q_threshold, kdj_n=kdj_n,
+            zx_m1=zx_m1, zx_m2=zx_m2, zx_m3=zx_m3, zx_m4=zx_m4,
+            zxdq_span=zxdq_span,
+            wma_short=wma_short, wma_mid=wma_mid, wma_long=wma_long,
+        )
+        self._b2_filter = B2VolumeReverseFilter(
+            b1_lookback=b1_lookback,
+            min_shrink_days=min_shrink_days,
+            volume_ratio=volume_ratio,
+            zxdkx_tolerance=zxdkx_tolerance,
+            max_return=max_return,
+            no_long_lower_shadow=no_long_lower_shadow,
+            shadow_body_ratio=shadow_body_ratio,
+        )
+        self._wma_filter: Optional[WeeklyMABullFilter] = (
+            WeeklyMABullFilter(wma_short=wma_short, wma_mid=wma_mid, wma_long=wma_long)
+            if require_weekly_ma_bull else None
+        )
+
+        _filters: list = [self._b2_filter]
+        if self._wma_filter is not None:
+            _filters.append(self._wma_filter)
+
+        super().__init__(
+            filters=_filters,
+            date_col=date_col,
+            min_bars=max(b1_lookback + 30, zx_m4),
+            extra_bars_buffer=extra_bars_buffer,
+        )
+        self.zx_m1, self.zx_m2, self.zx_m3, self.zx_m4 = zx_m1, zx_m2, zx_m3, zx_m4
+        self.zxdq_span = zxdq_span
+        self.wma_short, self.wma_mid, self.wma_long = wma_short, wma_mid, wma_long
+        self.kdj_n = kdj_n
+        self.require_weekly_ma_bull = require_weekly_ma_bull
+
+    def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """预计算 B1 mask → B2 特征列 → _vec_pick。"""
+        pf = self._b1_selector.prepare_df(df)
+        pf["_b1_pick"] = pf["_vec_pick"].copy()
+
+        _b2_filters: list = [self._b2_filter]
+        if self._wma_filter is not None:
+            _b2_filters.append(self._wma_filter)
+        pf["_vec_pick"] = _apply_vec_filters(pf, _b2_filters)
+        return pf
 
 
 # =============================================================================

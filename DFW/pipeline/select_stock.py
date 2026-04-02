@@ -22,7 +22,7 @@ import pandas as pd
 import yaml 
 
 from schemas import Candidate
-from Selector import B1Selector, BrickChartSelector
+from Selector import B1Selector, B2Selector, BrickChartSelector
 from pipeline_core import MarketDataPreparer, TopTurnoverPoolBuilder
 
 logger = logging.getLogger(__name__)
@@ -139,6 +139,13 @@ def _calc_warmup(cfg: dict, buffer: int) -> int:
     cfg_b1 = cfg.get("b1", {})
     if cfg_b1.get("enabled", True):
         warmup = max(warmup, int(cfg_b1.get("zx_m4", 371)) + buffer)
+
+    cfg_b2 = cfg.get("b2", {})
+    if cfg_b2.get("enabled", False):
+        warmup = max(
+            warmup,
+            int(cfg_b1.get("zx_m4", 114)) + int(cfg_b2.get("b1_lookback", 30)) + buffer,
+        )
 
     cfg_brick = cfg.get("brick", {})
     if cfg_brick.get("enabled", True):
@@ -277,12 +284,48 @@ def _compute_skill_scores(df: pd.DataFrame, pick_date: pd.Timestamp) -> Dict[str
 
     scores["abnormal_score"] = round(ab, 1)
 
+    # --- 4) 双线战法评分 ---
+    zx_score = 3.0
+    if "zxdq" in window.columns and "zxdkx" in window.columns:
+        zxdq_arr = window["zxdq"].to_numpy(dtype=float)
+        zxdkx_arr = window["zxdkx"].to_numpy(dtype=float)
+        zxdq_last = zxdq_arr[-1]
+        zxdkx_last = zxdkx_arr[-1]
+
+        if np.isfinite(zxdq_last) and np.isfinite(zxdkx_last) and zxdkx_last > 0:
+            spread = (zxdq_last - zxdkx_last) / zxdkx_last
+            close_to_zxdkx = (close[-1] - zxdkx_last) / zxdkx_last
+
+            if len(zxdq_arr) >= 5 and len(zxdkx_arr) >= 5:
+                zxdq_prev5 = float(zxdq_arr[-5]) if np.isfinite(zxdq_arr[-5]) else zxdq_last
+                zxdkx_prev5 = float(zxdkx_arr[-5]) if np.isfinite(zxdkx_arr[-5]) else zxdkx_last
+                prev_spread = (zxdq_prev5 - zxdkx_prev5) / max(zxdkx_prev5, 1e-9)
+                golden_cross = (prev_spread <= 0) and (spread > 0)
+            else:
+                golden_cross = False
+
+            if golden_cross:
+                zx_score = 5.0
+            elif 0 < spread <= 0.03 and 0 < close_to_zxdkx < 0.05:
+                zx_score = 4.5
+            elif 0 < spread <= 0.08:
+                zx_score = 4.0
+            elif spread > 0.15:
+                zx_score = 2.0
+            elif spread > 0:
+                zx_score = 3.0
+            else:
+                zx_score = 1.5
+
+    scores["zx_dual_line_score"] = round(zx_score, 1)
+
     # --- 加权总分 ---
     total = (
-        scores["vol_price_score"] * 0.30
-        + scores["trend_score"] * 0.20
-        + scores["abnormal_score"] * 0.30
-        + 3.0 * 0.20  # 价格位置由 AI 复评判断，此处使用中性值
+        scores["vol_price_score"] * 0.25
+        + scores["trend_score"] * 0.15
+        + scores["abnormal_score"] * 0.25
+        + scores["zx_dual_line_score"] * 0.15
+        + 3.0 * 0.20
     )
     scores["skill_total"] = round(total, 2)
 
@@ -343,6 +386,68 @@ def run_b1(
 
 
 # =============================================================================
+# B2 策略（B1 后缩量回调 + 倍量反包）
+# =============================================================================
+
+def run_b2(
+    prepared: Dict[str, pd.DataFrame],
+    pick_date: pd.Timestamp,
+    pool_codes: List[str],
+    cfg_b2: dict,
+    cfg_b1: dict,
+) -> List[Candidate]:
+    """在流动性池内运行 B2 策略，返回 Candidate 列表。
+
+    B2 依赖 B1 买点历史，因此内嵌 B1Selector 进行预计算。
+    """
+    zx_m1, zx_m2, zx_m3, zx_m4 = _sorted_zx(
+        cfg_b1.get("zx_m1", 14), cfg_b1.get("zx_m2", 28),
+        cfg_b1.get("zx_m3", 57), cfg_b1.get("zx_m4", 114),
+    )
+    selector = B2Selector(
+        j_threshold=float(cfg_b1.get("j_threshold", 15.0)),
+        j_q_threshold=float(cfg_b1.get("j_q_threshold", 0.10)),
+        zx_m1=zx_m1, zx_m2=zx_m2, zx_m3=zx_m3, zx_m4=zx_m4,
+        b1_lookback=int(cfg_b2.get("b1_lookback", 30)),
+        min_shrink_days=int(cfg_b2.get("min_shrink_days", 2)),
+        volume_ratio=float(cfg_b2.get("volume_ratio", 1.3)),
+        zxdkx_tolerance=float(cfg_b2.get("zxdkx_tolerance", 0.03)),
+        max_return=float(cfg_b2.get("max_return", 0.098)),
+        no_long_lower_shadow=bool(cfg_b2.get("no_long_lower_shadow", True)),
+        shadow_body_ratio=float(cfg_b2.get("shadow_body_ratio", 1.5)),
+        require_weekly_ma_bull=bool(cfg_b2.get("require_weekly_ma_bull", True)),
+    )
+
+    date_str = pick_date.strftime("%Y-%m-%d")
+    candidates: List[Candidate] = []
+
+    for code in pool_codes:
+        df = prepared.get(code)
+        if df is None or pick_date not in df.index:
+            continue
+        try:
+            pf = selector.prepare_df(df)
+            if selector.vec_picks_from_prepared(pf, start=pick_date, end=pick_date):
+                row = pf.loc[pick_date]
+                skill_scores = _compute_skill_scores(pf, pick_date)
+                candidates.append(Candidate(
+                    code=code,
+                    date=date_str,
+                    strategy="b2",
+                    close=float(row["close"]),
+                    turnover_n=float(row["turnover_n"]),
+                    extra=skill_scores,
+                ))
+        except Exception as exc:
+            logger.debug("B2 skip %s: %s", code, exc)
+
+    if candidates:
+        candidates.sort(key=lambda c: c.extra.get("skill_total", 0), reverse=True)
+    logger.info("B2 选出: %d 只", len(candidates))
+    return candidates
+
+
+# =============================================================================
 # 砖型图策略
 # =============================================================================
 
@@ -383,6 +488,10 @@ def run_brick(
         sma_w1=int(cfg_brick.get("sma_w1", 1)),
         sma_w2=int(cfg_brick.get("sma_w2", 1)),
         sma_w3=int(cfg_brick.get("sma_w3", 1)),
+        filter_upper_shadow=bool(cfg_brick.get("filter_upper_shadow", True)),
+        upper_shadow_ratio=float(cfg_brick.get("upper_shadow_ratio", 1.5)),
+        filter_zx_spread=bool(cfg_brick.get("filter_zx_spread", True)),
+        max_zx_spread=float(cfg_brick.get("max_zx_spread", 0.15)),
     )
 
     date_str = pick_date.strftime("%Y-%m-%d")
@@ -437,7 +546,7 @@ def run_preselect(
     data_dir    : CSV 目录（None = 读配置）
     end_date    : 数据截断日期（回测用）
     pick_date   : 选股基准日期（None = 自动最新）
-    strategy    : 指定运行单个策略 "b1" / "brick"（None = 按配置运行所有启用策略）
+    strategy    : 指定运行单个策略 "b1" / "b2" / "brick"（None = 按配置运行所有启用策略）
     """
     cfg = load_config(config_path)
     g = cfg.get("global", {})
@@ -476,20 +585,29 @@ def run_preselect(
 
     # 6) 决定运行哪些策略
     run_b1_flag = False
+    run_b2_flag = False
     run_brick_flag = False
 
     if strategy == "b1":
         run_b1_flag = True
+    elif strategy == "b2":
+        run_b2_flag = True
     elif strategy == "brick":
         run_brick_flag = True
     else:
         run_b1_flag = cfg.get("b1", {}).get("enabled", True)
+        run_b2_flag = cfg.get("b2", {}).get("enabled", False)
         run_brick_flag = cfg.get("brick", {}).get("enabled", True)
 
     all_candidates: List[Candidate] = []
 
     if run_b1_flag:
         all_candidates.extend(run_b1(prepared, pick_ts, pool_codes, cfg.get("b1", {})))
+
+    if run_b2_flag:
+        all_candidates.extend(
+            run_b2(prepared, pick_ts, pool_codes, cfg.get("b2", {}), cfg.get("b1", {}))
+        )
 
     if run_brick_flag:
         all_candidates.extend(run_brick(prepared, pick_ts, pool_codes, cfg.get("brick", {})))
